@@ -19,7 +19,7 @@ namespace Neo.Network.P2P.Payloads
     public class Transaction : IEquatable<Transaction>, IInventory, IInteroperable
     {
         public const int MaxTransactionSize = 102400;
-        public const uint MaxValidUntilBlockIncrement = 2102400;
+        public const uint MaxValidUntilBlockIncrement = 5760; // 24 hour
         /// <summary>
         /// Maximum number of attributes that can be contained within a transaction
         /// </summary>
@@ -62,7 +62,7 @@ namespace Neo.Network.P2P.Payloads
             {
                 if (_hash == null)
                 {
-                    _hash = new UInt256(Crypto.Hash256(this.GetHashData()));
+                    _hash = this.CalculateHash();
                 }
                 return _hash;
             }
@@ -92,7 +92,8 @@ namespace Neo.Network.P2P.Payloads
         }
 
         /// <summary>
-        /// Correspond with the first entry of Signers
+        /// The first signer is the sender of the transaction, regardless of its WitnessScope.
+        /// The sender will pay the fees of the transaction.
         /// </summary>
         public UInt160 Sender => _signers[0].Account;
 
@@ -178,10 +179,7 @@ namespace Neo.Network.P2P.Payloads
             for (int i = 0; i < count; i++)
             {
                 Signer signer = reader.ReadSerializable<Signer>();
-                if (i > 0 && signer.Scopes == WitnessScope.FeeOnly)
-                    throw new FormatException();
-                if (!hashset.Add(signer.Account))
-                    throw new FormatException();
+                if (!hashset.Add(signer.Account)) throw new FormatException();
                 yield return signer;
             }
         }
@@ -222,14 +220,15 @@ namespace Neo.Network.P2P.Payloads
 
         public T GetAttribute<T>() where T : TransactionAttribute
         {
-            return GetAttributes<T>()?.First();
+            return GetAttributes<T>().FirstOrDefault();
         }
 
-        public T[] GetAttributes<T>() where T : TransactionAttribute
+        public IEnumerable<T> GetAttributes<T>() where T : TransactionAttribute
         {
-            _attributesCache ??= attributes.GroupBy(p => p.GetType()).ToDictionary(p => p.Key, p => (TransactionAttribute[])p.OfType<T>().ToArray());
-            _attributesCache.TryGetValue(typeof(T), out var result);
-            return (T[])result;
+            _attributesCache ??= attributes.GroupBy(p => p.GetType()).ToDictionary(p => p.Key, p => p.ToArray());
+            if (_attributesCache.TryGetValue(typeof(T), out var result))
+                return result.OfType<T>();
+            return Enumerable.Empty<T>();
         }
 
         public override int GetHashCode()
@@ -237,7 +236,7 @@ namespace Neo.Network.P2P.Payloads
             return Hash.GetHashCode();
         }
 
-        public UInt160[] GetScriptHashesForVerifying(StoreView snapshot)
+        public UInt160[] GetScriptHashesForVerifying(DataCache snapshot)
         {
             return Signers.Select(p => p.Account).ToArray();
         }
@@ -278,40 +277,74 @@ namespace Neo.Network.P2P.Payloads
             return json;
         }
 
-        bool IInventory.Verify(StoreView snapshot)
+        bool IInventory.Verify(DataCache snapshot)
         {
             return Verify(snapshot, null) == VerifyResult.Succeed;
         }
 
-        public virtual VerifyResult VerifyForEachBlock(StoreView snapshot, TransactionVerificationContext context)
+        public virtual VerifyResult VerifyStateDependent(DataCache snapshot, TransactionVerificationContext context)
         {
-            if (ValidUntilBlock <= snapshot.Height || ValidUntilBlock > snapshot.Height + MaxValidUntilBlockIncrement)
+            uint height = NativeContract.Ledger.CurrentIndex(snapshot);
+            if (ValidUntilBlock <= height || ValidUntilBlock > height + MaxValidUntilBlockIncrement)
                 return VerifyResult.Expired;
-            UInt160[] hashes = GetScriptHashesForVerifying(snapshot);
-            if (NativeContract.Policy.GetBlockedAccounts(snapshot).Intersect(hashes).Any())
-                return VerifyResult.PolicyFail;
+            foreach (UInt160 hash in GetScriptHashesForVerifying(snapshot))
+                if (NativeContract.Policy.IsBlocked(snapshot, hash))
+                    return VerifyResult.PolicyFail;
             if (NativeContract.Policy.GetMaxBlockSystemFee(snapshot) < SystemFee)
                 return VerifyResult.PolicyFail;
             if (!(context?.CheckTransaction(this, snapshot) ?? true)) return VerifyResult.InsufficientFunds;
-            if (hashes.Length != Witnesses.Length) return VerifyResult.Invalid;
+            foreach (TransactionAttribute attribute in Attributes)
+                if (!attribute.Verify(snapshot, this))
+                    return VerifyResult.Invalid;
+            long net_fee = NetworkFee - Size * NativeContract.Policy.GetFeePerByte(snapshot);
+
+            UInt160[] hashes = GetScriptHashesForVerifying(snapshot);
+            if (hashes.Length != witnesses.Length) return VerifyResult.Invalid;
+
+            uint execFeeFactor = NativeContract.Policy.GetExecFeeFactor(snapshot);
             for (int i = 0; i < hashes.Length; i++)
             {
-                if (Witnesses[i].VerificationScript.Length > 0) continue;
-                if (snapshot.Contracts.TryGet(hashes[i]) is null) return VerifyResult.Invalid;
+                if (witnesses[i].VerificationScript.IsSignatureContract())
+                    net_fee -= execFeeFactor * SmartContract.Helper.SignatureContractCost();
+                else if (witnesses[i].VerificationScript.IsMultiSigContract(out int m, out int n))
+                    net_fee -= execFeeFactor * SmartContract.Helper.MultiSignatureContractCost(m, n);
+                else
+                {
+                    if (!this.VerifyWitness(snapshot, hashes[i], witnesses[i], net_fee, out long fee))
+                        return VerifyResult.Invalid;
+                    net_fee -= fee;
+                }
+                if (net_fee < 0) return VerifyResult.InsufficientFunds;
             }
             return VerifyResult.Succeed;
         }
 
-        public virtual VerifyResult Verify(StoreView snapshot, TransactionVerificationContext context)
+        public virtual VerifyResult VerifyStateIndependent()
         {
-            VerifyResult result = VerifyForEachBlock(snapshot, context);
-            if (result != VerifyResult.Succeed) return result;
-            int size = Size;
-            if (size > MaxTransactionSize) return VerifyResult.Invalid;
-            long net_fee = NetworkFee - size * NativeContract.Policy.GetFeePerByte(snapshot);
-            if (net_fee < 0) return VerifyResult.InsufficientFunds;
-            if (!this.VerifyWitnesses(snapshot, net_fee)) return VerifyResult.Invalid;
+            if (Size > MaxTransactionSize) return VerifyResult.Invalid;
+            try
+            {
+                _ = new Script(Script, true);
+            }
+            catch (BadScriptException)
+            {
+                return VerifyResult.Invalid;
+            }
+            UInt160[] hashes = GetScriptHashesForVerifying(null);
+            if (hashes.Length != witnesses.Length) return VerifyResult.Invalid;
+            for (int i = 0; i < hashes.Length; i++)
+                if (witnesses[i].VerificationScript.IsStandardContract())
+                    if (!this.VerifyWitness(null, hashes[i], witnesses[i], SmartContract.Helper.MaxVerificationGas, out _))
+                        return VerifyResult.Invalid;
             return VerifyResult.Succeed;
+        }
+
+        public virtual VerifyResult Verify(DataCache snapshot, TransactionVerificationContext context)
+        {
+            VerifyResult result = VerifyStateIndependent();
+            if (result != VerifyResult.Succeed) return result;
+            result = VerifyStateDependent(snapshot, context);
+            return result;
         }
 
         public StackItem ToStackItem(ReferenceCounter referenceCounter)

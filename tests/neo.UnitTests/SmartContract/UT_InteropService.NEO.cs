@@ -10,6 +10,8 @@ using Neo.SmartContract;
 using Neo.SmartContract.Iterators;
 using Neo.SmartContract.Manifest;
 using Neo.SmartContract.Native;
+using Neo.UnitTests.Extensions;
+using Neo.VM;
 using Neo.VM.Types;
 using Neo.Wallets;
 using System;
@@ -113,62 +115,82 @@ namespace Neo.UnitTests.SmartContract
                                     0x01, 0x01, 0x01, 0x01, 0x01 };
             engine.IsStandardContract(new UInt160(hash)).Should().BeFalse();
 
-            var snapshot = Blockchain.Singleton.GetSnapshot();
+            var snapshot = Blockchain.Singleton.GetSnapshot().CreateSnapshot();
             var state = TestUtils.GetContract();
-            snapshot.Contracts.Add(state.ScriptHash, state);
-            engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot, 0, true);
+            snapshot.AddContract(state.Hash, state);
+            engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot);
             engine.LoadScript(new byte[] { 0x01 });
-            engine.IsStandardContract(state.ScriptHash).Should().BeFalse();
+            engine.IsStandardContract(state.Hash).Should().BeFalse();
 
-            state.Script = Contract.CreateSignatureRedeemScript(Blockchain.StandbyValidators[0]);
-            engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot, 0, true);
+            state.Nef.Script = Contract.CreateSignatureRedeemScript(Blockchain.StandbyValidators[0]);
+            engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot);
             engine.LoadScript(new byte[] { 0x01 });
-            engine.IsStandardContract(state.ScriptHash).Should().BeTrue();
+            engine.IsStandardContract(state.Hash).Should().BeTrue();
         }
 
         [TestMethod]
         public void TestContract_Create()
         {
-            var engine = GetEngine(false, true);
-            var script = new byte[] { 0x01 };
-            Assert.ThrowsException<ArgumentException>(() => engine.CreateContract(script, new byte[ContractManifest.MaxLength + 1]));
+            var snapshot = Blockchain.Singleton.GetSnapshot().CreateSnapshot();
+            var nef = new NefFile()
+            {
+                Script = Enumerable.Repeat((byte)OpCode.RET, byte.MaxValue).ToArray(),
+                Compiler = "",
+                Tokens = System.Array.Empty<MethodToken>()
+            };
+            nef.CheckSum = NefFile.ComputeChecksum(nef);
+            var nefFile = nef.ToArray();
+            var manifest = TestUtils.CreateDefaultManifest();
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.DeployContract(null, nefFile, manifest.ToJson().ToByteArray(false)));
+            Assert.ThrowsException<ArgumentException>(() => snapshot.DeployContract(UInt160.Zero, nefFile, new byte[ContractManifest.MaxLength + 1]));
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.DeployContract(UInt160.Zero, nefFile, manifest.ToJson().ToByteArray(true), 10000000));
 
-            var manifest = TestUtils.CreateDefaultManifest(UInt160.Parse("0xa400ff00ff00ff00ff00ff00ff00ff00ff00ff01"));
-            Assert.ThrowsException<InvalidOperationException>(() => engine.CreateContract(script, manifest.ToJson().ToByteArray(false)));
+            var script_exceedMaxLength = new NefFile()
+            {
+                Script = new byte[NefFile.MaxScriptLength - 1],
+                Compiler = "",
+                Tokens = System.Array.Empty<MethodToken>()
+            };
+            script_exceedMaxLength.CheckSum = NefFile.ComputeChecksum(nef);
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.DeployContract(UInt160.Zero, script_exceedMaxLength.ToArray(), manifest.ToJson().ToByteArray(true)));
 
-            var script_exceedMaxLength = new byte[ApplicationEngine.MaxContractLength + 1];
-            Assert.ThrowsException<ArgumentException>(() => engine.CreateContract(script_exceedMaxLength, manifest.ToJson().ToByteArray(true)));
+            var script_zeroLength = System.Array.Empty<byte>();
+            Assert.ThrowsException<ArgumentException>(() => snapshot.DeployContract(UInt160.Zero, script_zeroLength, manifest.ToJson().ToByteArray(true)));
 
-            var script_zeroLength = new byte[] { };
-            Assert.ThrowsException<ArgumentException>(() => engine.CreateContract(script_zeroLength, manifest.ToJson().ToByteArray(true)));
+            var manifest_zeroLength = System.Array.Empty<byte>();
+            Assert.ThrowsException<ArgumentException>(() => snapshot.DeployContract(UInt160.Zero, nefFile, manifest_zeroLength));
 
-            var manifest_zeroLength = new byte[] { };
-            Assert.ThrowsException<ArgumentException>(() => engine.CreateContract(script, manifest_zeroLength));
+            manifest = TestUtils.CreateDefaultManifest();
+            var ret = snapshot.DeployContract(UInt160.Zero, nefFile, manifest.ToJson().ToByteArray(false));
+            ret.Hash.ToString().Should().Be("0x7b37d4bd3d87f53825c3554bd1a617318235a685");
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.DeployContract(UInt160.Zero, nefFile, manifest.ToJson().ToByteArray(false)));
 
-            manifest.Abi.Hash = script.ToScriptHash();
-            engine.CreateContract(script, manifest.ToJson().ToByteArray(false));
-
-            var snapshot = Blockchain.Singleton.GetSnapshot();
             var state = TestUtils.GetContract();
-            snapshot.Contracts.Add(state.ScriptHash, state);
-            engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot, 0);
-            engine.LoadScript(new byte[] { 0x01 });
-            Assert.ThrowsException<InvalidOperationException>(() => engine.CreateContract(state.Script, manifest.ToJson().ToByteArray(false)));
+            snapshot.AddContract(state.Hash, state);
+
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.DeployContract(UInt160.Zero, nefFile, manifest.ToJson().ToByteArray(false)));
         }
 
         [TestMethod]
         public void TestContract_Update()
         {
-            var engine = GetEngine(false, true);
-            var script = new byte[] { 0x01 };
-            Assert.ThrowsException<InvalidOperationException>(() => engine.UpdateContract(script, new byte[0]));
+            var snapshot = Blockchain.Singleton.GetSnapshot().CreateSnapshot();
+            var nef = new NefFile()
+            {
+                Script = new[] { (byte)OpCode.RET },
+                Compiler = "",
+                Tokens = System.Array.Empty<MethodToken>()
+            };
+            nef.CheckSum = NefFile.ComputeChecksum(nef);
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.UpdateContract(null, nef.ToArray(), new byte[0]));
 
-            var manifest = TestUtils.CreateDefaultManifest(script.ToScriptHash());
+            var manifest = TestUtils.CreateDefaultManifest();
             byte[] privkey = { 0x01,0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01};
             KeyPair key = new KeyPair(privkey);
             ECPoint pubkey = key.PublicKey;
-            byte[] signature = Crypto.Sign(script.ToScriptHash().ToArray(), privkey, pubkey.EncodePoint(false).Skip(1).ToArray());
+            var state = TestUtils.GetContract();
+            byte[] signature = Crypto.Sign(state.Hash.ToArray(), privkey, pubkey.EncodePoint(false).Skip(1).ToArray());
             manifest.Groups = new ContractGroup[]
             {
                 new ContractGroup()
@@ -177,10 +199,7 @@ namespace Neo.UnitTests.SmartContract
                     Signature = signature
                 }
             };
-            manifest.Features = ContractFeatures.HasStorage;
-            var snapshot = Blockchain.Singleton.GetSnapshot();
-            var state = TestUtils.GetContract();
-            state.Manifest.Features = ContractFeatures.HasStorage;
+
             var storageItem = new StorageItem
             {
                 Value = new byte[] { 0x01 },
@@ -192,20 +211,52 @@ namespace Neo.UnitTests.SmartContract
                 Id = state.Id,
                 Key = new byte[] { 0x01 }
             };
-            snapshot.Contracts.Add(state.ScriptHash, state);
-            snapshot.Storages.Add(storageKey, storageItem);
-            engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot, 0, true);
-            engine.LoadScript(state.Script);
-            engine.UpdateContract(script, manifest.ToJson().ToByteArray(false));
-            engine.Snapshot.Storages.Find(BitConverter.GetBytes(state.Id)).ToList().Count().Should().Be(1);
+            snapshot.AddContract(state.Hash, state);
+            snapshot.Add(storageKey, storageItem);
+            state.UpdateCounter.Should().Be(0);
+            snapshot.UpdateContract(state.Hash, nef.ToArray(), manifest.ToJson().ToByteArray(false));
+            var ret = NativeContract.ContractManagement.GetContract(snapshot, state.Hash);
+            snapshot.Find(BitConverter.GetBytes(state.Id)).ToList().Count().Should().Be(1);
+            ret.UpdateCounter.Should().Be(1);
+            ret.Id.Should().Be(state.Id);
+            ret.Manifest.ToJson().ToString().Should().Be(manifest.ToJson().ToString());
+            ret.Script.ToHexString().Should().Be(nef.Script.ToHexString().ToString());
+        }
+
+        [TestMethod]
+        public void TestContract_Update_Invalid()
+        {
+            var nefFile = new NefFile()
+            {
+                Script = new byte[] { 0x01 },
+                Compiler = "",
+                Tokens = System.Array.Empty<MethodToken>()
+            };
+            nefFile.CheckSum = NefFile.ComputeChecksum(nefFile);
+
+            var snapshot = Blockchain.Singleton.GetSnapshot().CreateSnapshot();
+
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.UpdateContract(null, null, new byte[] { 0x01 }));
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.UpdateContract(null, nefFile.ToArray(), null));
+            Assert.ThrowsException<ArgumentException>(() => snapshot.UpdateContract(null, null, null));
+
+            nefFile = new NefFile()
+            {
+                Script = new byte[0],
+                Compiler = "",
+                Tokens = System.Array.Empty<MethodToken>()
+            };
+            nefFile.CheckSum = NefFile.ComputeChecksum(nefFile);
+
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.UpdateContract(null, nefFile.ToArray(), new byte[] { 0x01 }));
+            Assert.ThrowsException<InvalidOperationException>(() => snapshot.UpdateContract(null, nefFile.ToArray(), new byte[0]));
         }
 
         [TestMethod]
         public void TestStorage_Find()
         {
-            var snapshot = Blockchain.Singleton.GetSnapshot();
+            var snapshot = Blockchain.Singleton.GetSnapshot().CreateSnapshot();
             var state = TestUtils.GetContract();
-            state.Manifest.Features = ContractFeatures.HasStorage;
 
             var storageItem = new StorageItem
             {
@@ -217,47 +268,34 @@ namespace Neo.UnitTests.SmartContract
                 Id = state.Id,
                 Key = new byte[] { 0x01 }
             };
-            snapshot.Contracts.Add(state.ScriptHash, state);
-            snapshot.Storages.Add(storageKey, storageItem);
-            var engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot, 0, true);
+            snapshot.AddContract(state.Hash, state);
+            snapshot.Add(storageKey, storageItem);
+            var engine = ApplicationEngine.Create(TriggerType.Application, null, snapshot);
             engine.LoadScript(new byte[] { 0x01 });
 
             var iterator = engine.Find(new StorageContext
             {
                 Id = state.Id,
                 IsReadOnly = false
-            }, new byte[] { 0x01 });
+            }, new byte[] { 0x01 }, FindOptions.ValuesOnly);
             iterator.Next();
             var ele = iterator.Value();
             ele.GetSpan().ToHexString().Should().Be(storageItem.Value.ToHexString());
         }
 
         [TestMethod]
-        public void TestEnumerator_Create()
+        public void TestIterator_Next()
         {
             var engine = GetEngine();
             var arr = new VMArray {
                 new byte[]{ 0x01 },
                 new byte[]{ 0x02 }
             };
-            var ret = engine.CreateEnumerator(arr);
-            ret.Next();
-            ret.Value().GetSpan().ToHexString().Should().Be(new byte[] { 0x01 }.ToHexString());
+            engine.IteratorNext(new ArrayWrapper(arr)).Should().BeTrue();
         }
 
         [TestMethod]
-        public void TestEnumerator_Next()
-        {
-            var engine = GetEngine();
-            var arr = new VMArray {
-                new byte[]{ 0x01 },
-                new byte[]{ 0x02 }
-            };
-            engine.EnumeratorNext(new ArrayWrapper(arr)).Should().BeTrue();
-        }
-
-        [TestMethod]
-        public void TestEnumerator_Value()
+        public void TestIterator_Value()
         {
             var engine = GetEngine();
             var arr = new VMArray {
@@ -266,26 +304,7 @@ namespace Neo.UnitTests.SmartContract
             };
             var wrapper = new ArrayWrapper(arr);
             wrapper.Next();
-            engine.EnumeratorValue(wrapper).GetSpan().ToHexString().Should().Be(new byte[] { 0x01 }.ToHexString());
-        }
-
-        [TestMethod]
-        public void TestEnumerator_Concat()
-        {
-            var engine = GetEngine();
-            var arr1 = new VMArray {
-                new byte[]{ 0x01 },
-                new byte[]{ 0x02 }
-            };
-            var arr2 = new VMArray {
-                new byte[]{ 0x03 },
-                new byte[]{ 0x04 }
-            };
-            var wrapper1 = new ArrayWrapper(arr1);
-            var wrapper2 = new ArrayWrapper(arr2);
-            var ret = engine.ConcatEnumerators(wrapper1, wrapper2);
-            ret.Next().Should().BeTrue();
-            ret.Value().GetSpan().ToHexString().Should().Be(new byte[] { 0x01 }.ToHexString());
+            engine.IteratorValue(wrapper).GetSpan().ToHexString().Should().Be(new byte[] { 0x01 }.ToHexString());
         }
 
         [TestMethod]
@@ -310,68 +329,9 @@ namespace Neo.UnitTests.SmartContract
             };
             ret = engine.CreateIterator(map);
             ret.Next();
-            ret.Key().GetInteger().Should().Be(1);
-            ret.Value().GetInteger().Should().Be(2);
-        }
-
-        [TestMethod]
-        public void TestIterator_Key()
-        {
-            var engine = GetEngine();
-            var arr = new VMArray {
-                new byte[]{ 0x01 },
-                new byte[]{ 0x02 }
-            };
-            var wrapper = new ArrayWrapper(arr);
-            wrapper.Next();
-            engine.IteratorKey(wrapper).GetInteger().Should().Be(0);
-        }
-
-        [TestMethod]
-        public void TestIterator_Keys()
-        {
-            var engine = GetEngine();
-            var arr = new VMArray {
-                new byte[]{ 0x01 },
-                new byte[]{ 0x02 }
-            };
-            var wrapper = new ArrayWrapper(arr);
-            var ret = engine.IteratorKeys(wrapper);
-            ret.Next();
-            ret.Value().GetInteger().Should().Be(0);
-        }
-
-        [TestMethod]
-        public void TestIterator_Values()
-        {
-            var engine = GetEngine();
-            var arr = new VMArray {
-                new byte[]{ 0x01 },
-                new byte[]{ 0x02 }
-            };
-            var wrapper = new ArrayWrapper(arr);
-            var ret = engine.IteratorValues(wrapper);
-            ret.Next();
-            ret.Value().GetSpan().ToHexString().Should().Be(new byte[] { 0x01 }.ToHexString());
-        }
-
-        [TestMethod]
-        public void TestIterator_Concat()
-        {
-            var engine = GetEngine();
-            var arr1 = new VMArray {
-                new byte[]{ 0x01 },
-                new byte[]{ 0x02 }
-            };
-            var arr2 = new VMArray {
-                new byte[]{ 0x03 },
-                new byte[]{ 0x04 }
-            };
-            var wrapper1 = new ArrayWrapper(arr1);
-            var wrapper2 = new ArrayWrapper(arr2);
-            var ret = engine.ConcatIterators(wrapper1, wrapper2);
-            ret.Next().Should().BeTrue();
-            ret.Value().GetSpan().ToHexString().Should().Be(new byte[] { 0x01 }.ToHexString());
+            Struct @struct = (Struct)ret.Value();
+            @struct[0].GetInteger().Should().Be(1);
+            @struct[1].GetInteger().Should().Be(2);
         }
 
         [TestMethod]

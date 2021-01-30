@@ -1,8 +1,10 @@
 using Neo.IO;
 using Neo.IO.Json;
+using Neo.VM;
+using Neo.VM.Types;
 using System;
-using System.IO;
 using System.Linq;
+using Array = Neo.VM.Types.Array;
 
 namespace Neo.SmartContract.Manifest
 {
@@ -10,39 +12,22 @@ namespace Neo.SmartContract.Manifest
     /// When a smart contract is deployed, it must explicitly declare the features and permissions it will use.
     /// When it is running, it will be limited by its declared list of features and permissions, and cannot make any behavior beyond the scope of the list.
     /// </summary>
-    public class ContractManifest : ISerializable
+    public class ContractManifest : IInteroperable
     {
         /// <summary>
         /// Max length for a valid Contract Manifest
         /// </summary>
-        public const int MaxLength = 4096;
+        public const int MaxLength = ushort.MaxValue;
 
         /// <summary>
-        /// Serialized size
+        /// Contract name
         /// </summary>
-        public int Size
-        {
-            get
-            {
-                int size = Utility.StrictUTF8.GetByteCount(ToString());
-                return IO.Helper.GetVarSize(size) + size;
-            }
-        }
-
-        /// <summary>
-        /// Contract hash
-        /// </summary>
-        public UInt160 Hash => Abi.Hash;
+        public string Name { get; set; }
 
         /// <summary>
         /// A group represents a set of mutually trusted contracts. A contract will trust and allow any contract in the same group to invoke it, and the user interface will not give any warnings.
         /// </summary>
         public ContractGroup[] Groups { get; set; }
-
-        /// <summary>
-        /// The features field describes what features are available for the contract.
-        /// </summary>
-        public ContractFeatures Features { get; set; }
 
         /// <summary>
         /// NEP10 - SupportedStandards
@@ -66,25 +51,39 @@ namespace Neo.SmartContract.Manifest
         public WildcardContainer<UInt160> Trusts { get; set; }
 
         /// <summary>
-        /// The safemethods field is an array containing a set of method names. It can also be assigned with a wildcard *. If it is a wildcard *, then it means that all methods of the contract are safe.
-        /// If a method is marked as safe, the user interface will not give any warnings when it is called by any other contract.
-        /// </summary>
-        public WildcardContainer<string> SafeMethods { get; set; }
-
-        /// <summary>
         /// Custom user data
         /// </summary>
         public JObject Extra { get; set; }
 
-        /// <summary>
-        /// Return true if is allowed
-        /// </summary>
-        /// <param name="manifest">Manifest</param>
-        /// <param name="method">Method</param>
-        /// <returns>Return true or false</returns>
-        public bool CanCall(ContractManifest manifest, string method)
+        void IInteroperable.FromStackItem(StackItem stackItem)
         {
-            return Permissions.Any(u => u.IsAllowed(manifest, method));
+            Struct @struct = (Struct)stackItem;
+            Name = @struct[0].GetString();
+            Groups = ((Array)@struct[1]).Select(p => p.ToInteroperable<ContractGroup>()).ToArray();
+            SupportedStandards = ((Array)@struct[2]).Select(p => p.GetString()).ToArray();
+            Abi = @struct[3].ToInteroperable<ContractAbi>();
+            Permissions = ((Array)@struct[4]).Select(p => p.ToInteroperable<ContractPermission>()).ToArray();
+            Trusts = @struct[5] switch
+            {
+                Null => WildcardContainer<UInt160>.CreateWildcard(),
+                Array array => WildcardContainer<UInt160>.Create(array.Select(p => new UInt160(p.GetSpan())).ToArray()),
+                _ => throw new ArgumentException(null, nameof(stackItem))
+            };
+            Extra = JObject.Parse(@struct[6].GetSpan());
+        }
+
+        public StackItem ToStackItem(ReferenceCounter referenceCounter)
+        {
+            return new Struct(referenceCounter)
+            {
+                Name,
+                new Array(referenceCounter, Groups.Select(p => p.ToStackItem(referenceCounter))),
+                new Array(referenceCounter, SupportedStandards.Select(p => (StackItem)p)),
+                Abi.ToStackItem(referenceCounter),
+                new Array(referenceCounter, Permissions.Select(p => p.ToStackItem(referenceCounter))),
+                Trusts.IsWildcard ? StackItem.Null : new Array(referenceCounter, Trusts.Select(p => (StackItem)p.ToArray())),
+                Extra is null ? "null" : Extra.ToByteArray(false)
+            };
         }
 
         /// <summary>
@@ -94,8 +93,24 @@ namespace Neo.SmartContract.Manifest
         /// <returns>Return ContractManifest</returns>
         public static ContractManifest FromJson(JObject json)
         {
-            var manifest = new ContractManifest();
-            manifest.DeserializeFromJson(json);
+            ContractManifest manifest = new ContractManifest
+            {
+                Name = json["name"].AsString(),
+                Groups = ((JArray)json["groups"]).Select(u => ContractGroup.FromJson(u)).ToArray(),
+                SupportedStandards = ((JArray)json["supportedstandards"]).Select(u => u.AsString()).ToArray(),
+                Abi = ContractAbi.FromJson(json["abi"]),
+                Permissions = ((JArray)json["permissions"]).Select(u => ContractPermission.FromJson(u)).ToArray(),
+                Trusts = WildcardContainer<UInt160>.FromJson(json["trusts"], u => UInt160.Parse(u.AsString())),
+                Extra = json["extra"]
+            };
+            if (string.IsNullOrEmpty(manifest.Name))
+                throw new FormatException();
+            _ = manifest.Groups.ToDictionary(p => p.PubKey);
+            if (manifest.SupportedStandards.Any(p => string.IsNullOrEmpty(p)))
+                throw new FormatException();
+            _ = manifest.SupportedStandards.ToDictionary(p => p);
+            _ = manifest.Permissions.ToDictionary(p => p.Contract);
+            _ = manifest.Trusts.ToDictionary(p => p);
             return manifest;
         }
 
@@ -104,9 +119,13 @@ namespace Neo.SmartContract.Manifest
         /// </summary>
         /// <param name="json">Json</param>
         /// <returns>Return ContractManifest</returns>
-        public static ContractManifest Parse(ReadOnlySpan<byte> json) => FromJson(JObject.Parse(json));
+        public static ContractManifest Parse(ReadOnlySpan<byte> json)
+        {
+            if (json.Length > MaxLength) throw new ArgumentException(null, nameof(json));
+            return FromJson(JObject.Parse(json));
+        }
 
-        public static ContractManifest Parse(string json) => FromJson(JObject.Parse(json));
+        public static ContractManifest Parse(string json) => Parse(Utility.StrictUTF8.GetBytes(json));
 
         /// <summary
         /// To json
@@ -115,68 +134,14 @@ namespace Neo.SmartContract.Manifest
         {
             return new JObject
             {
+                ["name"] = Name,
                 ["groups"] = Groups.Select(u => u.ToJson()).ToArray(),
-                ["features"] = new JObject
-                {
-                    ["storage"] = Features.HasFlag(ContractFeatures.HasStorage),
-                    ["payable"] = Features.HasFlag(ContractFeatures.Payable)
-                },
                 ["supportedstandards"] = SupportedStandards.Select(u => new JString(u)).ToArray(),
                 ["abi"] = Abi.ToJson(),
                 ["permissions"] = Permissions.Select(p => p.ToJson()).ToArray(),
                 ["trusts"] = Trusts.ToJson(),
-                ["safemethods"] = SafeMethods.ToJson(),
                 ["extra"] = Extra
             };
-        }
-
-        /// <summary>
-        /// Clone
-        /// </summary>
-        /// <returns>Return a copy of this object</returns>
-        public ContractManifest Clone()
-        {
-            return new ContractManifest
-            {
-                Groups = Groups.Select(p => p.Clone()).ToArray(),
-                Features = Features,
-                SupportedStandards = SupportedStandards[..],
-                Abi = Abi.Clone(),
-                Permissions = Permissions.Select(p => p.Clone()).ToArray(),
-                Trusts = Trusts,
-                SafeMethods = SafeMethods,
-                Extra = Extra?.Clone()
-            };
-        }
-
-        /// <summary>
-        /// String representation
-        /// </summary>
-        /// <returns>Return json string</returns>
-        public override string ToString() => ToJson().ToString();
-
-        public void Serialize(BinaryWriter writer)
-        {
-            writer.WriteVarString(ToString());
-        }
-
-        public void Deserialize(BinaryReader reader)
-        {
-            DeserializeFromJson(JObject.Parse(reader.ReadVarString(MaxLength)));
-        }
-
-        private void DeserializeFromJson(JObject json)
-        {
-            Groups = ((JArray)json["groups"]).Select(u => ContractGroup.FromJson(u)).ToArray();
-            Features = ContractFeatures.NoProperty;
-            if (json["features"]["storage"].AsBoolean()) Features |= ContractFeatures.HasStorage;
-            if (json["features"]["payable"].AsBoolean()) Features |= ContractFeatures.Payable;
-            SupportedStandards = ((JArray)json["supportedstandards"]).Select(u => u.AsString()).ToArray();
-            Abi = ContractAbi.FromJson(json["abi"]);
-            Permissions = ((JArray)json["permissions"]).Select(u => ContractPermission.FromJson(u)).ToArray();
-            Trusts = WildcardContainer<UInt160>.FromJson(json["trusts"], u => UInt160.Parse(u.AsString()));
-            SafeMethods = WildcardContainer<string>.FromJson(json["safemethods"], u => u.AsString());
-            Extra = json["extra"];
         }
 
         /// <summary>
@@ -185,7 +150,6 @@ namespace Neo.SmartContract.Manifest
         /// <returns>Return true or false</returns>
         public bool IsValid(UInt160 hash)
         {
-            if (!Abi.Hash.Equals(hash)) return false;
             return Groups.All(u => u.IsValid(hash));
         }
     }

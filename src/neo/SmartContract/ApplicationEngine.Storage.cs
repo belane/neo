@@ -1,30 +1,27 @@
-using Neo.Ledger;
 using Neo.SmartContract.Iterators;
+using Neo.SmartContract.Native;
 using System;
-using System.Collections.Generic;
 using System.Linq;
 
 namespace Neo.SmartContract
 {
     partial class ApplicationEngine
     {
-        public const long StoragePrice = 100000;
         public const int MaxStorageKeySize = 64;
         public const int MaxStorageValueSize = ushort.MaxValue;
 
-        public static readonly InteropDescriptor System_Storage_GetContext = Register("System.Storage.GetContext", nameof(GetStorageContext), 0_00000400, CallFlags.AllowStates, false);
-        public static readonly InteropDescriptor System_Storage_GetReadOnlyContext = Register("System.Storage.GetReadOnlyContext", nameof(GetReadOnlyContext), 0_00000400, CallFlags.AllowStates, false);
-        public static readonly InteropDescriptor System_Storage_AsReadOnly = Register("System.Storage.AsReadOnly", nameof(AsReadOnly), 0_00000400, CallFlags.AllowStates, false);
-        public static readonly InteropDescriptor System_Storage_Get = Register("System.Storage.Get", nameof(Get), 0_01000000, CallFlags.AllowStates, false);
-        public static readonly InteropDescriptor System_Storage_Find = Register("System.Storage.Find", nameof(Find), 0_01000000, CallFlags.AllowStates, false);
-        public static readonly InteropDescriptor System_Storage_Put = Register("System.Storage.Put", nameof(Put), 0, CallFlags.AllowModifyStates, false);
-        public static readonly InteropDescriptor System_Storage_PutEx = Register("System.Storage.PutEx", nameof(PutEx), 0, CallFlags.AllowModifyStates, false);
-        public static readonly InteropDescriptor System_Storage_Delete = Register("System.Storage.Delete", nameof(Delete), 1 * StoragePrice, CallFlags.AllowModifyStates, false);
+        public static readonly InteropDescriptor System_Storage_GetContext = Register("System.Storage.GetContext", nameof(GetStorageContext), 1 << 4, CallFlags.ReadStates);
+        public static readonly InteropDescriptor System_Storage_GetReadOnlyContext = Register("System.Storage.GetReadOnlyContext", nameof(GetReadOnlyContext), 1 << 4, CallFlags.ReadStates);
+        public static readonly InteropDescriptor System_Storage_AsReadOnly = Register("System.Storage.AsReadOnly", nameof(AsReadOnly), 1 << 4, CallFlags.ReadStates);
+        public static readonly InteropDescriptor System_Storage_Get = Register("System.Storage.Get", nameof(Get), 1 << 15, CallFlags.ReadStates);
+        public static readonly InteropDescriptor System_Storage_Find = Register("System.Storage.Find", nameof(Find), 1 << 15, CallFlags.ReadStates);
+        public static readonly InteropDescriptor System_Storage_Put = Register("System.Storage.Put", nameof(Put), 0, CallFlags.WriteStates);
+        public static readonly InteropDescriptor System_Storage_PutEx = Register("System.Storage.PutEx", nameof(PutEx), 0, CallFlags.WriteStates);
+        public static readonly InteropDescriptor System_Storage_Delete = Register("System.Storage.Delete", nameof(Delete), 0, CallFlags.WriteStates);
 
-        internal StorageContext GetStorageContext()
+        protected internal StorageContext GetStorageContext()
         {
-            ContractState contract = Snapshot.Contracts.TryGet(CurrentScriptHash);
-            if (!contract.HasStorage) throw new InvalidOperationException();
+            ContractState contract = NativeContract.ContractManagement.GetContract(Snapshot, CurrentScriptHash);
             return new StorageContext
             {
                 Id = contract.Id,
@@ -32,10 +29,9 @@ namespace Neo.SmartContract
             };
         }
 
-        internal StorageContext GetReadOnlyContext()
+        protected internal StorageContext GetReadOnlyContext()
         {
-            ContractState contract = Snapshot.Contracts.TryGet(CurrentScriptHash);
-            if (!contract.HasStorage) throw new InvalidOperationException();
+            ContractState contract = NativeContract.ContractManagement.GetContract(Snapshot, CurrentScriptHash);
             return new StorageContext
             {
                 Id = contract.Id,
@@ -43,7 +39,7 @@ namespace Neo.SmartContract
             };
         }
 
-        internal StorageContext AsReadOnly(StorageContext context)
+        protected internal StorageContext AsReadOnly(StorageContext context)
         {
             if (!context.IsReadOnly)
                 context = new StorageContext
@@ -54,30 +50,37 @@ namespace Neo.SmartContract
             return context;
         }
 
-        internal byte[] Get(StorageContext context, byte[] key)
+        protected internal byte[] Get(StorageContext context, byte[] key)
         {
-            return Snapshot.Storages.TryGet(new StorageKey
+            return Snapshot.TryGet(new StorageKey
             {
                 Id = context.Id,
                 Key = key.ToArray()
             })?.Value;
         }
 
-        internal IIterator Find(StorageContext context, byte[] prefix)
+        protected internal IIterator Find(StorageContext context, byte[] prefix, FindOptions options)
         {
+            if ((options & ~FindOptions.All) != 0)
+                throw new ArgumentOutOfRangeException(nameof(options));
+            if (options.HasFlag(FindOptions.KeysOnly) && (options.HasFlag(FindOptions.ValuesOnly) || options.HasFlag(FindOptions.DeserializeValues) || options.HasFlag(FindOptions.PickField0) || options.HasFlag(FindOptions.PickField1)))
+                throw new ArgumentException();
+            if (options.HasFlag(FindOptions.ValuesOnly) && (options.HasFlag(FindOptions.KeysOnly) || options.HasFlag(FindOptions.RemovePrefix)))
+                throw new ArgumentException();
+            if (options.HasFlag(FindOptions.PickField0) && options.HasFlag(FindOptions.PickField1))
+                throw new ArgumentException();
+            if ((options.HasFlag(FindOptions.PickField0) || options.HasFlag(FindOptions.PickField1)) && !options.HasFlag(FindOptions.DeserializeValues))
+                throw new ArgumentException();
             byte[] prefix_key = StorageKey.CreateSearchPrefix(context.Id, prefix);
-            StorageIterator iterator = new StorageIterator(Snapshot.Storages.Find(prefix_key).Where(p => p.Key.Key.AsSpan().StartsWith(prefix)).GetEnumerator());
-            disposables ??= new List<IDisposable>();
-            disposables.Add(iterator);
-            return iterator;
+            return new StorageIterator(Snapshot.Find(prefix_key).GetEnumerator(), options, ReferenceCounter);
         }
 
-        internal void Put(StorageContext context, byte[] key, byte[] value)
+        protected internal void Put(StorageContext context, byte[] key, byte[] value)
         {
             PutExInternal(context, key, value, StorageFlags.None);
         }
 
-        internal void PutEx(StorageContext context, byte[] key, byte[] value, StorageFlags flags)
+        protected internal void PutEx(StorageContext context, byte[] key, byte[] value, StorageFlags flags)
         {
             PutExInternal(context, key, value, flags);
         }
@@ -93,19 +96,21 @@ namespace Neo.SmartContract
                 Id = context.Id,
                 Key = key
             };
-            StorageItem item = Snapshot.Storages.GetAndChange(skey);
+            StorageItem item = Snapshot.GetAndChange(skey);
             if (item is null)
             {
                 newDataSize = key.Length + value.Length;
-                Snapshot.Storages.Add(skey, item = new StorageItem());
+                Snapshot.Add(skey, item = new StorageItem());
             }
             else
             {
                 if (item.IsConstant) throw new InvalidOperationException();
-                if (value.Length <= item.Value.Length)
+                if (value.Length == 0)
                     newDataSize = 1;
+                else if (value.Length <= item.Value.Length)
+                    newDataSize = (value.Length - 1) / 4 + 1;
                 else
-                    newDataSize = value.Length - item.Value.Length;
+                    newDataSize = (item.Value.Length - 1) / 4 + 1 + value.Length - item.Value.Length;
             }
             AddGas(newDataSize * StoragePrice);
 
@@ -113,17 +118,18 @@ namespace Neo.SmartContract
             item.IsConstant = flags.HasFlag(StorageFlags.Constant);
         }
 
-        internal void Delete(StorageContext context, byte[] key)
+        protected internal void Delete(StorageContext context, byte[] key)
         {
             if (context.IsReadOnly) throw new ArgumentException();
+            AddGas(StoragePrice);
             StorageKey skey = new StorageKey
             {
                 Id = context.Id,
                 Key = key
             };
-            if (Snapshot.Storages.TryGet(skey)?.IsConstant == true)
+            if (Snapshot.TryGet(skey)?.IsConstant == true)
                 throw new InvalidOperationException();
-            Snapshot.Storages.Delete(skey);
+            Snapshot.Delete(skey);
         }
     }
 }
